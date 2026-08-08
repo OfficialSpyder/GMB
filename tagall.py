@@ -1,77 +1,113 @@
-# modules/tagall.py
-
 import asyncio
+import logging
 from telegram import Update
 from telegram.ext import ContextTypes
+import database as db
 
-TAGGING_PROCESSES = {}
+logger = logging.getLogger(__name__)
 
+# Active tagging sessions dictionary {chat_id: True/False}
+TAGALL_SESSIONS = {}
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.effective_chat or not update.effective_user:
+        return False
+    if update.effective_chat.type == "private":
+        return True
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in ["administrator", "creator"]
+    except Exception:
+        return False
+
+# --- 1. TAGALL COMMAND ---
 async def tagall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /tagall, /mentionall, and /all commands."""
+    """/tagall [custom message] - Mention ALL stored members (Active + Inactive)"""
     chat = update.effective_chat
     user = update.effective_user
 
-    if chat.type not in ["group", "supergroup"]:
-        await update.message.reply_text("❌ This command can only be used in groups!")
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ <b>Only Admins can use /tagall!</b>", parse_mode="HTML")
         return
 
-    # Admin check
-    member = await chat.get_member(user.id)
-    if member.status not in ["administrator", "creator"]:
-        await update.message.reply_text("⚠️ <b>Admin Access Only!</b> Only admins can tag members.", parse_mode="HTML")
+    if chat.id in TAGALL_SESSIONS and TAGALL_SESSIONS[chat.id]:
+        await update.message.reply_text("⚠️ <b>A tagging process is already running!</b> Use /cancel to stop it.", parse_mode="HTML")
         return
 
-    custom_text = " ".join(context.args) if context.args else "📢 <b>ATTENTION EVERYONE!</b>"
-    if update.message.reply_to_message and not context.args:
-        custom_text = update.message.reply_to_message.text or custom_text
+    # Extract custom reason/text if provided
+    custom_text = " ".join(context.args) if context.args else "Attention Everyone! 📢"
+    
+    # Fetch ALL stored members from Database for this chat (Active + Silent + Inactive)
+    members_list = []
+    if hasattr(db, 'get_all_chat_members'):
+        members_list = db.get_all_chat_members(chat.id)
+    elif hasattr(db, 'get_chat_users'):
+        members_list = db.get_chat_users(chat.id)
 
-    TAGGING_PROCESSES[chat.id] = True
+    if not members_list:
+        await update.message.reply_text(
+            "⚠️ <b>No member database found for this chat yet!</b>\n\n"
+            "<i>Note: As users interact or join, they get stored in DB. Currently tagall operates on all stored users.</i>", 
+            parse_mode="HTML"
+        )
+        return
 
-    status_msg = await update.message.reply_text(
-        "⚡ <b>Initiating Global Mention Protocol...</b>\n"
-        "💡 <i>Send /cancel to stop tagging.</i>",
+    # Start Tagging Session
+    TAGALL_SESSIONS[chat.id] = True
+    await update.message.reply_text(
+        f"📢 <b>Starting TagAll for {len(members_list)} members...</b>\n"
+        f"💬 <b>Reason:</b> {custom_text}\n\n"
+        f"<i>Use /cancel or /stopall to abort.</i>", 
         parse_mode="HTML"
     )
 
-    try:
-        admins = await chat.get_administrators()
-        tagged_text = f"{custom_text}\n\n"
-        count = 0
+    # Chunk into batches of 5 users per message (Telegram Limit Safe)
+    batch_size = 5
+    for i in range(0, len(members_list), batch_size):
+        # Check if process was cancelled
+        if not TAGALL_SESSIONS.get(chat.id, False):
+            await update.message.reply_text("🛑 <b>TagAll process stopped!</b>", parse_mode="HTML")
+            return
 
-        for admin in admins:
-            if not TAGGING_PROCESSES.get(chat.id, False):
-                await update.message.reply_text("🛑 <b>Tagging Process Cancelled!</b>", parse_mode="HTML")
-                return
+        batch = members_list[i:i + batch_size]
+        mentions = []
 
-            if admin.user.is_bot:
-                continue
+        for member in batch:
+            # Handle dictionary or tuple format from DB
+            user_id = member.get("user_id") if isinstance(member, dict) else member[0] if isinstance(member, (tuple, list)) else member
+            first_name = member.get("first_name", "User") if isinstance(member, dict) else "User"
 
-            first_name = admin.user.first_name.replace("<", "&lt;").replace(">", "&gt;")
-            tagged_text += f"▪️ <a href='tg://user?id={admin.user.id}'>{first_name}</a>\n"
-            count += 1
+            mentions.append(f'<a href="tg://user?id={user_id}">{first_name}</a>')
 
-            # Batch of 5 members to prevent rate limit
-            if count % 5 == 0:
-                await chat.send_message(tagged_text, parse_mode="HTML")
-                tagged_text = f"{custom_text}\n\n"
-                await asyncio.sleep(2)
+        tag_text = f"📢 <b>{custom_text}</b>\n\n" + " ".join(mentions)
 
-        if count % 5 != 0:
-            await chat.send_message(tagged_text, parse_mode="HTML")
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=tag_text,
+                parse_mode="HTML"
+            )
+            # Sleep 2 seconds between batches to avoid Telegram Rate Limit / Spam Ban
+            await asyncio.sleep(2.0)
+        except Exception as e:
+            logger.error(f"[TAGALL] Error while tagging: {e}")
+            await asyncio.sleep(3.0)
 
-        await status_msg.edit_text(f"✅ <b>Global Mention Completed!</b> Tagged <code>{count}</code> members.", parse_mode="HTML")
+    # Clean session
+    TAGALL_SESSIONS[chat.id] = False
+    await update.message.reply_text("✅ <b>TagAll completed successfully for all members!</b>", parse_mode="HTML")
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error during mention: <code>{e}</code>", parse_mode="HTML")
-    finally:
-        TAGGING_PROCESSES.pop(chat.id, None)
-
-
+# --- 2. CANCEL / STOP COMMAND ---
 async def cancel_tagall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cancel - Stops the active tagging process."""
+    """/cancel or /stopall - Stops the current tagall process"""
     chat = update.effective_chat
-    if chat.id in TAGGING_PROCESSES:
-        TAGGING_PROCESSES[chat.id] = False
-        await update.message.reply_text("⏳ Stopping TagAll process...", parse_mode="HTML")
+
+    if not await is_admin(update, context):
+        await update.message.reply_text("❌ Only admins can stop tagging.", parse_mode="HTML")
+        return
+
+    if chat.id in TAGALL_SESSIONS and TAGALL_SESSIONS[chat.id]:
+        TAGALL_SESSIONS[chat.id] = False
+        await update.message.reply_text("🛑 <b>Stopping TagAll process...</b>", parse_mode="HTML")
     else:
-        await update.message.reply_text("❓ No active tagging process running.")
+        await update.message.reply_text("ℹ️ No active TagAll process running in this chat.", parse_mode="HTML")
